@@ -647,30 +647,82 @@ actual class BlueFalcon actual constructor(
             }
         }
 
+        @Deprecated("Used on Android 12 and below; Android 13+ uses the value-based overload")
         override fun onCharacteristicRead(
             gatt: BluetoothGatt?,
             characteristic: BluetoothGattCharacteristic?,
             status: Int
         ) {
             log?.debug("onCharacteristicRead ${characteristic?.uuid} status=$status")
-            handleCharacteristicValueChange(gatt, characteristic)
+            handleCharacteristicValueChange(gatt, characteristic, characteristic?.value)
         }
 
+        // Android 13+ (API 33) value-based callback.
+        override fun onCharacteristicRead(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray,
+            status: Int
+        ) {
+            log?.debug("onCharacteristicRead ${characteristic.uuid} status=$status")
+            handleCharacteristicValueChange(gatt, characteristic, value)
+        }
+
+        @Deprecated("Used on Android 12 and below; Android 13+ uses the value-based overload")
         override fun onCharacteristicChanged(
             gatt: BluetoothGatt?,
             characteristic: BluetoothGattCharacteristic?
         ) {
-            handleCharacteristicValueChange(gatt, characteristic)
+            handleCharacteristicValueChange(gatt, characteristic, characteristic?.value)
         }
 
+        // Android 13+ (API 33) value-based callback. On apps targeting SDK 33+ the
+        // platform dispatches notifications/indications here instead of the deprecated
+        // overload above, so it must be implemented to avoid dropping notifications.
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray
+        ) {
+            handleCharacteristicValueChange(gatt, characteristic, value)
+        }
+
+        @Deprecated("Used on Android 12 and below; Android 13+ uses the value-based overload")
         override fun onDescriptorRead(
             gatt: BluetoothGatt?,
             descriptor: BluetoothGattDescriptor?,
             status: Int
         ) {
+            handleDescriptorRead(gatt, descriptor, descriptor?.value)
+        }
+
+        // Android 13+ (API 33) value-based callback. Param order: (gatt, descriptor, status, value).
+        // On apps targeting SDK 33+ the platform dispatches descriptor reads here instead of the
+        // deprecated overload above, and no longer populates getValue(), so the value must be used.
+        override fun onDescriptorRead(
+            gatt: BluetoothGatt,
+            descriptor: BluetoothGattDescriptor,
+            status: Int,
+            value: ByteArray
+        ) {
+            handleDescriptorRead(gatt, descriptor, value)
+        }
+
+        private fun handleDescriptorRead(
+            gatt: BluetoothGatt?,
+            descriptor: BluetoothGattDescriptor?,
+            value: ByteArray?
+        ) {
             log?.debug("onDescriptorRead ${descriptor?.uuid}")
             descriptor?.let { forcedDescriptor ->
                 gatt?.device?.let { bluetoothDevice ->
+                    // On Android 13+ the value arrives via the callback parameter and the
+                    // deprecated getValue() may be stale; write it back so consumers reading
+                    // the descriptor's value observe the freshly read bytes.
+                    if (value != null) {
+                        @Suppress("DEPRECATION")
+                        forcedDescriptor.value = value
+                    }
                     log?.debug("onDescriptorRead value ${forcedDescriptor.value}")
                     delegates.forEach {
                         it.didReadDescriptor(
@@ -737,10 +789,18 @@ actual class BlueFalcon actual constructor(
 
         private fun handleCharacteristicValueChange(
             gatt: BluetoothGatt?,
-            characteristic: BluetoothGattCharacteristic?
+            characteristic: BluetoothGattCharacteristic?,
+            value: ByteArray?
         ) {
-            log?.debug("[${gatt?.device?.address}] handleCharacteristicValueChange ${characteristic?.uuid} ${characteristic?.value.contentToString()}")
+            log?.debug("[${gatt?.device?.address}] handleCharacteristicValueChange ${characteristic?.uuid} ${value.contentToString()}")
             characteristic?.let { forcedCharacteristic ->
+                // On Android 13+ the value arrives via the callback parameter and the
+                // deprecated getValue() may be stale. Write it back so consumers reading
+                // BluetoothCharacteristic.value observe the freshly delivered bytes.
+                if (value != null) {
+                    @Suppress("DEPRECATION")
+                    forcedCharacteristic.value = value
+                }
                 val characteristic = BluetoothCharacteristic(forcedCharacteristic)
                 gatt?.device?.let { bluetoothDevice ->
                     delegates.forEach {

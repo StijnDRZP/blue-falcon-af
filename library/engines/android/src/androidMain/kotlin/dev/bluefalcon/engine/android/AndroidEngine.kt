@@ -525,6 +525,7 @@ class AndroidEngine(
             }
         }
         
+        @Deprecated("Used on Android 12 and below; Android 13+ uses the value-based overload")
         override fun onCharacteristicRead(
             gatt: BluetoothGatt?,
             characteristic: BluetoothGattCharacteristic?,
@@ -532,15 +533,47 @@ class AndroidEngine(
         ) {
             logger?.debug("onCharacteristicRead ${characteristic?.uuid} status=$status")
         }
-        
+
+        // Android 13+ (API 33) value-based callback.
+        override fun onCharacteristicRead(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray,
+            status: Int
+        ) {
+            logger?.debug("onCharacteristicRead ${characteristic.uuid} status=$status")
+            @Suppress("DEPRECATION")
+            characteristic.value = value
+        }
+
+        @Deprecated("Used on Android 12 and below; Android 13+ uses the value-based overload")
         override fun onCharacteristicChanged(
             gatt: BluetoothGatt?,
             characteristic: BluetoothGattCharacteristic?
         ) {
             logger?.debug("onCharacteristicChanged ${characteristic?.uuid}")
             if (gatt == null || characteristic == null) return
-
             val value = characteristic.value?.copyOf() ?: return
+            emitCharacteristicChanged(gatt, characteristic, value)
+        }
+
+        // Android 13+ (API 33) value-based callback. On apps targeting SDK 33+ the
+        // platform dispatches notifications/indications here instead of the deprecated
+        // overload above, so it must be implemented to avoid dropping notifications.
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray
+        ) {
+            logger?.debug("onCharacteristicChanged ${characteristic.uuid}")
+            emitCharacteristicChanged(gatt, characteristic, value.copyOf())
+        }
+
+        private fun emitCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray
+        ) {
             val peripheral =
                 _peripherals.value.find { (it as? AndroidBluetoothPeripheral)?.device?.address == gatt.device.address }
                     ?: AndroidBluetoothPeripheral(gatt.device)
@@ -570,7 +603,21 @@ class AndroidEngine(
         ) {
             logger?.debug("onDescriptorRead ${descriptor?.uuid}")
         }
-        
+
+        // Android 13+ (API 33) value-based callback. getValue() is not reliably
+        // populated here, so write the delivered value back so consumers reading
+        // the descriptor's value observe the freshly read bytes.
+        override fun onDescriptorRead(
+            gatt: BluetoothGatt,
+            descriptor: BluetoothGattDescriptor,
+            status: Int,
+            value: ByteArray
+        ) {
+            logger?.debug("onDescriptorRead ${descriptor.uuid}")
+            @Suppress("DEPRECATION")
+            descriptor.value = value
+        }
+
         override fun onDescriptorWrite(
             gatt: BluetoothGatt?,
             descriptor: BluetoothGattDescriptor?,
