@@ -18,7 +18,11 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.CopyOnWriteArrayList
 
 /**
@@ -66,12 +70,19 @@ class AndroidEngine(
                     @Suppress("DEPRECATION")
                     intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
                 } ?: return
-                
-                logger?.debug("Bond state changed for ${device.address}")
+
+                val bondState = intent.getIntExtra(
+                    BluetoothDevice.EXTRA_BOND_STATE,
+                    BluetoothDevice.BOND_NONE
+                )
+                logger?.debug("Bond state changed for ${device.address} -> $bondState")
+                _bondStateChanges.tryEmit(device.address to bondState)
             }
         }
     }
-    
+    // Emits (deviceAddress, bondState) on every ACTION_BOND_STATE_CHANGED so createBond() can await completion.
+    private val _bondStateChanges = MutableSharedFlow<Pair<String, Int>>(extraBufferCapacity = 16)
+
     init {
         BluetoothStateMonitor.register(context, this)
         _managerState.value = try {
@@ -92,30 +103,37 @@ class AndroidEngine(
         }
     }
     
+    // Holds the service UUID filters requested by the caller so addScanResult can
+    // apply them in software against the full scan record (primary PDU + SCAN_RESP).
+    private var pendingScanFilters: List<ServiceFilter> = emptyList()
+
     override suspend fun scan(filters: List<ServiceFilter>) {
         logger?.info("Starting scan with ${filters.size} filters")
         isScanning = true
-        
-        val scanFilters: List<ScanFilter> = if (filters.isEmpty()) {
-            listOf(ScanFilter.Builder().build())
-        } else {
-            filters.map { filter ->
-                val filterBuilder = ScanFilter.Builder()
-                val parcelUuid = android.os.ParcelUuid(java.util.UUID.fromString(filter.uuid.toString()))
-                filterBuilder.setServiceUuid(parcelUuid)
-                filterBuilder.build()
-            }
-        }
-        
+        pendingScanFilters = filters
+
+        // Always scan unfiltered at the hardware/offload level.
+        // Android's chipset-level ScanFilter.setServiceUuid() only inspects the primary
+        // advertising PDU (ADV_IND). Many BLE devices put their 128-bit service UUID in
+        // the SCAN_RESPONSE packet instead to save space in the 31-byte primary PDU — a
+        // completely standard firmware practice. The offloaded filter never sees those
+        // SCAN_RESP packets, so those devices are silently dropped from scan results.
+        // Software matching in addScanResult checks scanRecord.serviceUuids, which
+        // aggregates both the primary PDU and the SCAN_RESPONSE, and is therefore correct.
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
-        bluetoothManager.adapter?.bluetoothLeScanner?.startScan(scanFilters, settings, scanCallback)
+        bluetoothManager.adapter?.bluetoothLeScanner?.startScan(
+            listOf(ScanFilter.Builder().build()), // unfiltered — software filter applied below
+            settings,
+            scanCallback
+        )
     }
     
     override suspend fun stopScanning() {
         logger?.info("Stopping scan")
         isScanning = false
+        pendingScanFilters = emptyList()
         bluetoothManager.adapter?.bluetoothLeScanner?.stopScan(scanCallback)
     }
     
@@ -226,11 +244,34 @@ class AndroidEngine(
         characteristic: BluetoothCharacteristic,
         notify: Boolean
     ) {
+        // Auto-detect the correct CCCD value from the characteristic's actual properties.
+        // Some peripherals expose their notify characteristic as INDICATE-only; writing the
+        // NOTIFY enable value [0x01,0x00] to such a characteristic succeeds (onDescriptorWrite
+        // status=0) but never enables delivery, so onCharacteristicChanged is never called.
+        // This mirrors what well-behaved BLE stacks (e.g. the capacitor-community plugin) do.
+        val androidChar = (characteristic as? AndroidBluetoothCharacteristic)?.characteristic
+        val props = androidChar?.properties ?: 0
+        val hasNotify = (props and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0
+        val hasIndicate = (props and BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0
+        logger?.debug(
+            "notifyCharacteristic ${characteristic.uuid} notify=$notify " +
+                "props=0x${props.toString(16)} (NOTIFY=$hasNotify, INDICATE=$hasIndicate)"
+        )
+        // Prefer NOTIFY when available (matches the reference capacitor-community plugin), falling
+        // back to INDICATE only when the characteristic is indicate-only. Writing the wrong CCCD
+        // value still returns onDescriptorWrite status=0 but never delivers onCharacteristicChanged.
+        val enableValue = if (hasNotify) {
+            BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+        } else if (hasIndicate) {
+            BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+        } else {
+            BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+        }
         setCharacteristicNotification(
             peripheral,
             characteristic,
             notify,
-            if (notify) BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            if (notify) enableValue
             else BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
         )
     }
@@ -331,7 +372,25 @@ class AndroidEngine(
         logger?.debug("createBond ${peripheral.uuid}")
         ensureBondReceiverRegistered()
         val device = (peripheral as? AndroidBluetoothPeripheral)?.device ?: return
-        device.createBond()
+        if (device.bondState == BluetoothDevice.BOND_BONDED) {
+            logger?.debug("createBond ${device.address} — already bonded")
+            return
+        }
+        // Start listening before initiating so we cannot miss the BONDED transition.
+        val initiated = device.createBond()
+        logger?.debug("createBond ${device.address} — createBond() returned $initiated, awaiting BONDED")
+        if (device.bondState == BluetoothDevice.BOND_BONDED) return
+        val finalState = withTimeoutOrNull(BOND_TIMEOUT_MS) {
+            _bondStateChanges
+                .filter { (address, _) -> address == device.address }
+                .map { (_, state) -> state }
+                .first { it == BluetoothDevice.BOND_BONDED || it == BluetoothDevice.BOND_NONE }
+        }
+        when (finalState) {
+            BluetoothDevice.BOND_BONDED -> logger?.debug("createBond ${device.address} — bonded")
+            BluetoothDevice.BOND_NONE -> logger?.error("createBond ${device.address} — bonding failed/removed")
+            else -> logger?.error("createBond ${device.address} — bonding timed out after ${BOND_TIMEOUT_MS}ms")
+        }
     }
     
     override suspend fun removeBond(peripheral: BluetoothPeripheral) {
@@ -369,8 +428,18 @@ class AndroidEngine(
                 gatt.setCharacteristicNotification(char, enable)
                 descriptorValue?.let { value ->
                     char.descriptors.forEach { descriptor ->
-                        descriptor.value = value
-                        gatt.writeDescriptor(descriptor)
+                        // On API 33+ the deprecated setValue()+writeDescriptor() overload silently
+                        // returns false on some devices and onDescriptorWrite never fires, so the
+                        // peripheral never receives the CCCD enable and never sends notifications.
+                        // Use the new value-carrying writeDescriptor(descriptor, value) on API 33+.
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            gatt.writeDescriptor(descriptor, value)
+                        } else {
+                            @Suppress("DEPRECATION")
+                            descriptor.value = value
+                            @Suppress("DEPRECATION")
+                            gatt.writeDescriptor(descriptor)
+                        }
                     }
                 }
             }
@@ -411,6 +480,20 @@ class AndroidEngine(
         private fun addScanResult(result: ScanResult?) {
             logger?.debug("addScanResult $result")
             result?.device?.let { device ->
+                // Software service UUID filter — checks both the primary advertising PDU and
+                // the SCAN_RESPONSE via scanRecord.serviceUuids. This is necessary because
+                // many devices advertise their 128-bit UUID only in SCAN_RESP, which the
+                // Android chipset-level filter never sees.
+                if (pendingScanFilters.isNotEmpty()) {
+                    val advertised = result.scanRecord?.serviceUuids
+                        ?.map { it.uuid.toString().lowercase() }
+                        .orEmpty()
+                    val matches = pendingScanFilters.any { f ->
+                        f.uuid.toString().lowercase() in advertised
+                    }
+                    if (!matches) return
+                }
+
                 val bluetoothPeripheral = AndroidBluetoothPeripheral(device)
                 val newRssi = result.rssi.toFloat()
                 bluetoothPeripheral.rssi = newRssi
@@ -629,5 +712,6 @@ class AndroidEngine(
     
     companion object {
         private const val DISCONNECT_TIMEOUT_MS = 5_000L
+        private const val BOND_TIMEOUT_MS = 20_000L
     }
 }
